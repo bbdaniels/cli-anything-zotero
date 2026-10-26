@@ -140,7 +140,7 @@ class PathDiscoveryTests(unittest.TestCase):
             self.assertEqual(zotero_paths.bundled_plugin_version(), "1.3.0")
             self.assertFalse(zotero_paths.plugin_update_available(env["profile_dir"]))
             self.assertEqual(zotero_app["strict_min_version"], "6.999")
-            self.assertEqual(zotero_app["strict_max_version"], "9.0.*")
+            self.assertEqual(zotero_app["strict_max_version"], "10.*")
 
     def test_find_executable_returns_none_when_unresolved(self):
         with mock.patch.dict("os.environ", {}, clear=True):
