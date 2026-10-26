@@ -60,6 +60,15 @@ _REGISTER_JS = (
 )
 
 
+def _js_literal(value: Any) -> str:
+    """Serialize data as a JavaScript literal, including quotes for strings.
+
+    ASCII escaping also protects control characters, U+2028/U+2029, and
+    lone surrogates. Numbers and lists retain their types.
+    """
+    return json.dumps(value, ensure_ascii=True, allow_nan=False)
+
+
 # ── Private transport helpers ────────────────────────────────────────
 
 def _check_applescript_platform() -> None:
@@ -157,7 +166,16 @@ def _execute_applescript(code: str, *, wait_seconds: int = 3, capture: bool = Tr
         os.remove(_RESULT_FILE)
 
     js_code = _inject_result_capture(code) if capture else code
-    escaped = js_code.replace("\\", "\\\\").replace('"', '\\"')
+    # This is a separate AppleScript string-literal layer, not JavaScript.
+    # Escape backslashes first so JS escapes survive the clipboard round trip.
+    # JSON's \uXXXX escapes must not be used as AppleScript string escapes.
+    escaped = (
+        js_code.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+    )
 
     menu_click = _MENU_PATHS.get(_LOCALE, _MENU_PATHS["en"])
 
@@ -213,10 +231,9 @@ end tell
 
 
 def _inject_result_capture(code: str) -> str:
-    safe_path = _RESULT_FILE.replace("\\", "/")
     return (
         f"var __r = await (async () => {{ {code} }})(); "
-        f"await Zotero.File.putContentsAsync('{safe_path}', JSON.stringify(__r)); "
+        f"await Zotero.File.putContentsAsync({_js_literal(_RESULT_FILE)}, JSON.stringify(__r)); "
         f"return __r;"
     )
 
@@ -321,22 +338,18 @@ class JSBridgeClient:
         abs_path = os.path.abspath(pdf_path)
         if not os.path.isfile(abs_path):
             return {"ok": False, "error": f"File not found: {abs_path}"}
-        # On Windows, abspath returns backslashes which break JS string literals
-        # when embedded directly (\t → TAB, \n → newline, etc.).
-        # Must double-escape backslashes for JS, and escape single quotes.
-        safe_path = abs_path.replace("\\", "\\\\").replace("'", "\\'")
         js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
-            f"var att = await Zotero.Attachments.importFromFile({{file: '{safe_path}', parentItemID: item.id}}); "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
+            f"var att = await Zotero.Attachments.importFromFile({{file: {_js_literal(abs_path)}, parentItemID: item.id}}); "
             f"return 'OK: ' + att.key + ' attached to ' + item.getField('title').substring(0,60);"
         )
         return self.execute_js(js, wait_seconds=4)
 
     def find_pdf(self, item_key: str, *, library_id: int = 1, timeout: int = 30) -> dict:
         js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
             f"var att = await Zotero.Attachments.addAvailablePDF(item); "
             f"return att ? 'FOUND: ' + att.key : 'NOT_FOUND: no PDF available for ' + item.getField('title').substring(0,60);"
         )
@@ -345,15 +358,18 @@ class JSBridgeClient:
         if result.get("ok") or (result.get("error") and "timed out" not in str(result.get("error", "")).lower()):
             return result
 
+        timeout_message = (
+            f"TIMEOUT: PDF lookup timed out after {timeout}s and no PDF attachment found yet. "
+            "Zotero may still be downloading — retry shortly or check Zotero manually."
+        )
         check_js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
             f"var aids = item.getAttachments(); "
             f"for (var id of aids) {{ var a = Zotero.Items.get(id); "
             f"  if (a && a.attachmentContentType === 'application/pdf') "
             f"    return 'FOUND: ' + a.key; }} "
-            f"return 'TIMEOUT: PDF lookup timed out after {timeout}s and no PDF attachment found yet. "
-            f"Zotero may still be downloading — retry shortly or check Zotero manually.';"
+            f"return {_js_literal(timeout_message)};"
         )
         return self.execute_js(check_js, wait_seconds=10)
 
@@ -361,12 +377,12 @@ class JSBridgeClient:
         if not fields_dict:
             return {"ok": False, "error": "No fields provided"}
         set_lines = " ".join(
-            f"item.setField('{k}', '{v.replace(chr(39), chr(92) + chr(39))}');"
+            f"item.setField({_js_literal(k)}, {_js_literal(v)});"
             for k, v in fields_dict.items()
         )
         js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
             f"{set_lines} "
             f"await item.saveTx(); "
             f"return 'OK: updated ' + item.getField('title').substring(0,60);"
@@ -378,14 +394,12 @@ class JSBridgeClient:
             return {"ok": False, "error": "No tags to add or remove"}
         tag_lines = ""
         for t in add_tags:
-            safe = t.replace("'", "\\'")
-            tag_lines += f"item.addTag('{safe}'); "
+            tag_lines += f"item.addTag({_js_literal(t)}); "
         for t in remove_tags:
-            safe = t.replace("'", "\\'")
-            tag_lines += f"item.removeTag('{safe}'); "
+            tag_lines += f"item.removeTag({_js_literal(t)}); "
         js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
             f"{tag_lines}"
             f"await item.saveTx(); "
             f"return 'OK: tags updated for ' + item.getField('title').substring(0,60);"
@@ -402,16 +416,16 @@ class JSBridgeClient:
         """
         if permanent:
             js = (
-                f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-                f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
+                f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+                f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
                 f"var title = item.getField('title').substring(0,60); "
                 f"await item.eraseTx(); "
                 f"return 'ERASED: ' + title;"
             )
             return self.execute_js(js, wait_seconds=4)
         js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
             f"var title = item.getField('title').substring(0,60); "
             f"if (item.deleted) {{ return 'ALREADY_TRASHED: ' + title; }} "
             f"item.deleted = true; "
@@ -423,8 +437,8 @@ class JSBridgeClient:
     def restore_item(self, item_key: str, *, library_id: int = 1) -> dict:
         """Restore a trashed item (the counterpart to a default ``delete``)."""
         js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
             f"var title = item.getField('title').substring(0,60); "
             f"if (!item.deleted) {{ return 'NOT_TRASHED: ' + title; }} "
             f"item.deleted = false; "
@@ -463,8 +477,8 @@ class JSBridgeClient:
 
     def get_annotations(self, item_key: str, *, library_id: int = 1) -> dict:
         js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
             f"if (item.isAttachment && item.isAttachment()) {{ "
             f"  var parent = Zotero.Items.get(item.parentItemID); "
             f"  if (!parent) {{ return 'ERROR: attachment has no parent item'; }} "
@@ -494,13 +508,12 @@ class JSBridgeClient:
         parts: list[str] = []
         if collection_key:
             parts.append(
-                f"var col = Zotero.Collections.getByLibraryAndKey({library_id}, '{collection_key}'); "
+                f"var col = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(collection_key)}); "
                 f"if (col) {{ item.addToCollection(col.id); }}"
             )
         if tags:
             for t in tags:
-                safe = t.replace("'", "\\'")
-                parts.append(f"item.addTag('{safe}');")
+                parts.append(f"item.addTag({_js_literal(t)});")
         if collection_key or tags:
             parts.append("await item.saveTx();")
         return " ".join(parts)
@@ -515,24 +528,23 @@ class JSBridgeClient:
 
         Callers should inspect ``data.ok`` (application-level), not only transport ``ok``.
         """
-        safe_doi = doi.replace("'", "\\'")
         post_import_js = self._build_post_import_js(collection_key, tags, library_id)
         js = (
             "try { "
             f"var translate = new Zotero.Translate.Search(); "
-            f"translate.setIdentifier({{DOI: '{safe_doi}'}}); "
+            f"translate.setIdentifier({{DOI: {_js_literal(doi)}}}); "
             f"var translators = await translate.getTranslators(); "
             f"if (!translators || !translators.length) {{ "
-            f"  return {{ok:false, code:'NO_TRANSLATOR', error:'No DOI translators available for {safe_doi}', DOI:'{safe_doi}'}}; "
+            f"  return {{ok:false, code:'NO_TRANSLATOR', error:{_js_literal('No DOI translators available for ' + doi)}, DOI:{_js_literal(doi)}}}; "
             f"}} "
             f"translate.setTranslator(translators); "
-            f"var items = await translate.translate({{libraryID: {library_id}}}); "
+            f"var items = await translate.translate({{libraryID: {_js_literal(library_id)}}}); "
             f"if (!items || !items.length) {{ "
-            f"  return {{ok:false, code:'TRANSLATOR_EMPTY', error:'No items returned from any translator for DOI {safe_doi}', DOI:'{safe_doi}'}}; "
+            f"  return {{ok:false, code:'TRANSLATOR_EMPTY', error:{_js_literal('No items returned from any translator for DOI ' + doi)}, DOI:{_js_literal(doi)}}}; "
             f"}} "
             f"var item = items[0]; "
             f"{post_import_js} "
-            f"return {{ok:true, code:'IMPORTED', key: item.key, title: item.getField('title'), DOI: item.getField('DOI') || '{safe_doi}', source:'zotero-translator'}}; "
+            f"return {{ok:true, code:'IMPORTED', key: item.key, title: item.getField('title'), DOI: item.getField('DOI') || {_js_literal(doi)}, source:'zotero-translator'}}; "
             "} catch (e) { "
             "  return {ok:false, code:'TRANSLATOR_ERROR', error: (e && (e.message || e.toString && e.toString()) || String(e)), "
             "          name: e && e.name || null, stack: e && e.stack ? String(e.stack).slice(0,500) : null}; "
@@ -541,20 +553,19 @@ class JSBridgeClient:
         return self.execute_js(js, wait_seconds=45)
 
     def import_from_pmid(self, pmid: str, *, collection_key: str | None = None, tags: list[str] | None = None, library_id: int = 1) -> dict:
-        safe_pmid = pmid.replace("'", "\\'")
         post_import_js = self._build_post_import_js(collection_key, tags, library_id)
         js = (
             "try { "
             f"var translate = new Zotero.Translate.Search(); "
-            f"translate.setIdentifier({{PMID: '{safe_pmid}'}}); "
+            f"translate.setIdentifier({{PMID: {_js_literal(pmid)}}}); "
             f"var translators = await translate.getTranslators(); "
             f"if (!translators || !translators.length) {{ "
-            f"  return {{ok:false, code:'NO_TRANSLATOR', error:'No PMID translators available for {safe_pmid}', PMID:'{safe_pmid}'}}; "
+            f"  return {{ok:false, code:'NO_TRANSLATOR', error:{_js_literal('No PMID translators available for ' + pmid)}, PMID:{_js_literal(pmid)}}}; "
             f"}} "
             f"translate.setTranslator(translators); "
-            f"var items = await translate.translate({{libraryID: {library_id}}}); "
+            f"var items = await translate.translate({{libraryID: {_js_literal(library_id)}}}); "
             f"if (!items || !items.length) {{ "
-            f"  return {{ok:false, code:'TRANSLATOR_EMPTY', error:'No items returned from any translator for PMID {safe_pmid}', PMID:'{safe_pmid}'}}; "
+            f"  return {{ok:false, code:'TRANSLATOR_EMPTY', error:{_js_literal('No items returned from any translator for PMID ' + pmid)}, PMID:{_js_literal(pmid)}}}; "
             f"}} "
             f"var item = items[0]; "
             f"{post_import_js} "
@@ -568,14 +579,13 @@ class JSBridgeClient:
 
     def find_items_by_doi(self, doi: str, *, library_id: int = 1, limit: int = 20) -> dict:
         """Search library items by DOI field (via Zotero.Search)."""
-        safe_doi = doi.replace("'", "\\'")
         js = (
             f"var s = new Zotero.Search(); "
-            f"s.libraryID = {library_id}; "
-            f"s.addCondition('DOI', 'is', '{safe_doi}'); "
+            f"s.libraryID = {_js_literal(library_id)}; "
+            f"s.addCondition('DOI', 'is', {_js_literal(doi)}); "
             f"var ids = await s.search(); "
             f"var items = await Zotero.Items.getAsync(ids); "
-            f"return items.slice(0, {int(limit)}).filter(i => i.isRegularItem()).map(i => ({{"
+            f"return items.slice(0, {_js_literal(int(limit))}).filter(i => i.isRegularItem()).map(i => ({{"
             f"key: i.key, title: i.getField('title'), DOI: i.getField('DOI'), "
             f"date: i.getField('date')"
             f"}}));"
@@ -585,8 +595,8 @@ class JSBridgeClient:
     def list_items_missing_pdf(self, collection_key: str, *, library_id: int = 1) -> dict:
         """Return regular items in a collection that lack a PDF attachment."""
         js = (
-            f"var c = Zotero.Collections.getByLibraryAndKey({library_id}, '{collection_key}'); "
-            f"if (!c) {{ return {{ok:false, error:'collection {collection_key} not found'}}; }} "
+            f"var c = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(collection_key)}); "
+            f"if (!c) {{ return {{ok:false, error:{_js_literal('collection ' + collection_key + ' not found')}}}; }} "
             "var ids = c.getChildItems(true); "
             "var items = ids.map(id => Zotero.Items.get(id)).filter(i => i && i.isRegularItem && i.isRegularItem()); "
             "var missing = []; "
@@ -608,36 +618,34 @@ class JSBridgeClient:
     # ── Search operations ─────────────────────────────────────────
 
     def search_fulltext(self, query: str, *, limit: int = 10, library_id: int = 1) -> dict:
-        safe_query = query.replace("'", "\\'")
         js = (
             f"var s = new Zotero.Search(); "
-            f"s.libraryID = {library_id}; "
-            f"s.addCondition('fulltextContent', 'contains', '{safe_query}'); "
+            f"s.libraryID = {_js_literal(library_id)}; "
+            f"s.addCondition('fulltextContent', 'contains', {_js_literal(query)}); "
             f"var ids = await s.search(); "
             f"var items = await Zotero.Items.getAsync(ids); "
-            f"return items.slice(0, {limit}).map(i => ({{key: i.key, title: i.getField('title'), date: i.getField('date')}}));"
+            f"return items.slice(0, {_js_literal(limit)}).map(i => ({{key: i.key, title: i.getField('title'), date: i.getField('date')}}));"
         )
         return self.execute_js(js, wait_seconds=8)
 
     def search_annotations(self, query: str = "", *, colors: list[str] | None = None, limit: int = 20, library_id: int = 1) -> dict:
         if query:
-            safe_q = query.replace("'", "\\'")
-            search_cond = f"s.addCondition('annotationText', 'contains', '{safe_q}');"
+            search_cond = f"s.addCondition('annotationText', 'contains', {_js_literal(query)});"
         else:
             search_cond = "s.addCondition('itemType', 'is', 'annotation');"
 
         color_filter = "true"
         if colors:
-            color_list = json.dumps(colors)
+            color_list = _js_literal(colors)
             color_filter = f"{color_list}.includes(a.annotationColor)"
 
         js = (
-            f"var s = new Zotero.Search(); s.libraryID = {library_id}; "
+            f"var s = new Zotero.Search(); s.libraryID = {_js_literal(library_id)}; "
             f"{search_cond} "
             f"var ids = await s.search(); "
             f"var annots = await Zotero.Items.getAsync(ids); "
             f"var filtered = annots.filter(a => {color_filter}); "
-            f"return filtered.slice(0, {limit}).map(a => {{ "
+            f"return filtered.slice(0, {_js_literal(limit)}).map(a => {{ "
             f"var parent = Zotero.Items.get(a.parentItemID); "
             f"var grandparent = parent ? Zotero.Items.get(parent.parentItemID) : null; "
             f"var title = grandparent ? grandparent.getField('title').substring(0,60) : (parent ? parent.getField('title').substring(0,60) : ''); "
@@ -651,10 +659,10 @@ class JSBridgeClient:
 
     def add_to_collection(self, item_key: str, collection_key: str, *, library_id: int = 1) -> dict:
         js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
-            f"var col = Zotero.Collections.getByLibraryAndKey({library_id}, '{collection_key}'); "
-            f"if (!col) {{ return 'ERROR: collection {collection_key} not found'; }} "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
+            f"var col = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(collection_key)}); "
+            f"if (!col) {{ return {_js_literal('ERROR: collection ' + collection_key + ' not found')}; }} "
             f"item.addToCollection(col.id); "
             f"await item.saveTx(); "
             f"return 'OK: added ' + item.getField('title').substring(0,60) + ' to ' + col.name;"
@@ -663,10 +671,10 @@ class JSBridgeClient:
 
     def remove_from_collection(self, item_key: str, collection_key: str, *, library_id: int = 1) -> dict:
         js = (
-            f"var item = Zotero.Items.getByLibraryAndKey({library_id}, '{item_key}'); "
-            f"if (!item) {{ return 'ERROR: item {item_key} not found'; }} "
-            f"var col = Zotero.Collections.getByLibraryAndKey({library_id}, '{collection_key}'); "
-            f"if (!col) {{ return 'ERROR: collection {collection_key} not found'; }} "
+            f"var item = Zotero.Items.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(item_key)}); "
+            f"if (!item) {{ return {_js_literal('ERROR: item ' + item_key + ' not found')}; }} "
+            f"var col = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(collection_key)}); "
+            f"if (!col) {{ return {_js_literal('ERROR: collection ' + collection_key + ' not found')}; }} "
             f"item.removeFromCollection(col.id); "
             f"await item.saveTx(); "
             f"return 'OK: removed ' + item.getField('title').substring(0,50) + ' from ' + col.name;"
@@ -674,20 +682,19 @@ class JSBridgeClient:
         return self.execute_js(js, wait_seconds=4)
 
     def create_collection(self, name: str, *, parent_key: str | None = None, library_id: int = 1) -> dict:
-        safe_name = name.replace("'", "\\'")
         parent_js = ""
         if parent_key:
             parent_js = (
-                f"var parent = Zotero.Collections.getByLibraryAndKey({library_id}, '{parent_key}'); "
+                f"var parent = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(parent_key)}); "
                 f"if (parent) {{ col.parentID = parent.id; }} "
             )
         js = (
             f"var col = new Zotero.Collection(); "
-            f"col.name = '{safe_name}'; "
-            f"col.libraryID = {library_id}; "
+            f"col.name = {_js_literal(name)}; "
+            f"col.libraryID = {_js_literal(library_id)}; "
             f"{parent_js}"
             f"await col.saveTx(); "
-            f"return {{key: col.key, id: col.id, name: col.name, libraryID: {library_id}}};"
+            f"return {{key: col.key, id: col.id, name: col.name, libraryID: {_js_literal(library_id)}}};"
         )
         return self.execute_js(js, wait_seconds=4)
 
@@ -712,8 +719,8 @@ class JSBridgeClient:
                 else "await col.eraseTx({deleteItems: false});"
             )
             js = (
-                f"var col = Zotero.Collections.getByLibraryAndKey({library_id}, '{collection_key}'); "
-                f"if (!col) {{ return 'ERROR: collection {collection_key} not found'; }} "
+                f"var col = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(collection_key)}); "
+                f"if (!col) {{ return {_js_literal('ERROR: collection ' + collection_key + ' not found')}; }} "
                 f"var name = col.name; "
                 f"{erase} "
                 f"return 'ERASED: collection ' + name;"
@@ -725,8 +732,8 @@ class JSBridgeClient:
             "  if (ci && !ci.deleted) { ci.deleted = true; await ci.saveTx(); trashed++; } } "
         ) if delete_items else ""
         js = (
-            f"var col = Zotero.Collections.getByLibraryAndKey({library_id}, '{collection_key}'); "
-            f"if (!col) {{ return 'ERROR: collection {collection_key} not found'; }} "
+            f"var col = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(collection_key)}); "
+            f"if (!col) {{ return {_js_literal('ERROR: collection ' + collection_key + ' not found')}; }} "
             f"var name = col.name; var trashed = 0; "
             f"{trash_items_js}"
             f"if (col.deleted) {{ return 'ALREADY_TRASHED: collection ' + name; }} "
@@ -739,8 +746,8 @@ class JSBridgeClient:
     def restore_collection(self, collection_key: str, *, library_id: int = 1) -> dict:
         """Restore a trashed collection."""
         js = (
-            f"var col = Zotero.Collections.getByLibraryAndKey({library_id}, '{collection_key}'); "
-            f"if (!col) {{ return 'ERROR: collection {collection_key} not found'; }} "
+            f"var col = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(collection_key)}); "
+            f"if (!col) {{ return {_js_literal('ERROR: collection ' + collection_key + ' not found')}; }} "
             f"var name = col.name; "
             f"if (!col.deleted) {{ return 'NOT_TRASHED: collection ' + name; }} "
             f"col.deleted = false; "
@@ -752,18 +759,17 @@ class JSBridgeClient:
     def update_collection(self, collection_key: str, *, name: str | None = None, parent_key: str | None = None, library_id: int = 1) -> dict:
         set_lines = ""
         if name:
-            safe_name = name.replace("'", "\\'")
-            set_lines += f"col.name = '{safe_name}'; "
+            set_lines += f"col.name = {_js_literal(name)}; "
         if parent_key:
             set_lines += (
-                f"var parent = Zotero.Collections.getByLibraryAndKey({library_id}, '{parent_key}'); "
+                f"var parent = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(parent_key)}); "
                 f"if (parent) {{ col.parentID = parent.id; }} "
             )
         if not set_lines:
             return {"ok": False, "data": None, "error": "No changes specified (use --name or --parent)"}
         js = (
-            f"var col = Zotero.Collections.getByLibraryAndKey({library_id}, '{collection_key}'); "
-            f"if (!col) {{ return 'ERROR: collection {collection_key} not found'; }} "
+            f"var col = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(collection_key)}); "
+            f"if (!col) {{ return {_js_literal('ERROR: collection ' + collection_key + ' not found')}; }} "
             f"{set_lines}"
             f"await col.saveTx(); "
             f"return 'OK: updated collection ' + col.name;"
@@ -772,8 +778,8 @@ class JSBridgeClient:
 
     def collection_stats(self, collection_key: str, *, library_id: int = 1) -> dict:
         js = (
-            f"var c = Zotero.Collections.getByLibraryAndKey({library_id}, '{collection_key}'); "
-            f"if (!c) {{ return 'ERROR: collection {collection_key} not found'; }} "
+            f"var c = Zotero.Collections.getByLibraryAndKey({_js_literal(library_id)}, {_js_literal(collection_key)}); "
+            f"if (!c) {{ return {_js_literal('ERROR: collection ' + collection_key + ' not found')}; }} "
             f"var ids = c.getChildItems(true); "
             f"var items = ids.map(id => Zotero.Items.get(id)).filter(i => i && !i.isAttachment() && !i.isNote()); "
             f"var total = items.length; "
